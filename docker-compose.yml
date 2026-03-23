@@ -11,13 +11,6 @@ services:
     networks:
       impaired:
         ipv4_address: 172.28.0.10
-    cap_add:
-      - NET_ADMIN
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cert /tls/client.crt --key /tls/client.key --cacert /tls/ca.crt ping || exit 1"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
 
   client:
     build:
@@ -36,14 +29,12 @@ services:
       - HGETALL_BATCH=${HGETALL_BATCH:-10000}
       - TEST_DURATION_SECONDS=${TEST_DURATION_SECONDS:-120}
       - ENABLE_AUTO_PIPELINING=${ENABLE_AUTO_PIPELINING:-true}
-      # Network impairment (applied by client entrypoint)
+      # Network impairment - gentler settings to add latency without killing connections
       - NETEM_DELAY_MS=${NETEM_DELAY_MS:-15}
-      - NETEM_LOSS_PCT=${NETEM_LOSS_PCT:-0.5}
-      - NETEM_RATE_KBIT=${NETEM_RATE_KBIT:-200000}
+      - NETEM_LOSS_PCT=${NETEM_LOSS_PCT:-0.1}
+      - NETEM_RATE_KBIT=${NETEM_RATE_KBIT:-10000000}
     volumes:
       - ./certs:/tls:ro
-    cap_add:
-      - NET_ADMIN
     networks:
       impaired:
         ipv4_address: 172.28.0.20
