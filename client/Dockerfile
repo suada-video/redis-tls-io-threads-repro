@@ -1,10 +1,13 @@
 FROM node:20-slim
 
+RUN apt-get update && apt-get install -y iproute2 && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY package.json ./
 RUN npm install --production
 
-COPY index.js ./
+COPY entrypoint.sh index.js ./
+RUN chmod +x entrypoint.sh
 
-CMD ["node", "--max-old-space-size=4096", "index.js"]
+ENTRYPOINT ["./entrypoint.sh"]

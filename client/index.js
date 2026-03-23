@@ -1,59 +1,59 @@
 /**
- * Redis 8 TLS + io-threads bug reproducer.
+ * Redis 8 TLS + large response bug reproducer.
  *
- * Creates multiple TLS connections to Redis with auto-pipelining enabled,
- * stores large values, and then hammers GET requests to force Redis to
- * write multi-MB responses through its IO threads. With io-threads > 1,
- * this triggers TLS record corruption → SSL errors → connection resets.
+ * Simulates the exact BullMQ getJobs() pattern that triggers the bug:
+ * 1. EVALSHA (getRanges Lua script) returns N job IDs via ZRANGE/LRANGE
+ * 2. N × HGETALL pipelined (auto-pipelining batches them into one pipeline)
+ * 3. Redis writes ~N × 865 bytes through TLS → multi-MB response
+ * 4. With network latency/backpressure, SSL_write does partial writes → corruption
  *
  * Environment variables:
- *   REDIS_HOST              - Redis hostname (default: redis)
- *   REDIS_PORT              - Redis port (default: 6379)
- *   TLS_CA                  - Path to CA cert
- *   TLS_CERT                - Path to client cert
- *   TLS_KEY                 - Path to client key
- *   NUM_CONNECTIONS          - Number of parallel connections (default: 50)
- *   VALUE_SIZE_BYTES         - Size of each test value in bytes (default: 1MB)
- *   NUM_KEYS                - Number of large keys to create (default: 20)
- *   PIPELINE_BATCH           - Number of GETs to pipeline per batch (default: 200)
- *   TEST_DURATION_SECONDS    - How long to run the test (default: 120)
- *   ENABLE_AUTO_PIPELINING   - Enable ioredis auto-pipelining (default: true)
+ *   REDIS_HOST, REDIS_PORT, TLS_CA, TLS_CERT, TLS_KEY
+ *   NUM_CONNECTIONS          - Parallel connections (default: 30)
+ *   NUM_JOBS                 - Number of fake BullMQ jobs to create (default: 50000)
+ *   HGETALL_BATCH            - How many HGETALLs to pipeline per round (default: 10000)
+ *   TEST_DURATION_SECONDS    - Duration (default: 120)
+ *   ENABLE_AUTO_PIPELINING   - Match production (default: true)
  */
 
 const Redis = require("ioredis");
 const fs = require("fs");
 const crypto = require("crypto");
 
-// Config from environment
 const REDIS_HOST = process.env.REDIS_HOST || "redis";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379", 10);
-const TLS_CA = process.env.TLS_CA || "/tls/ca.crt";
-const TLS_CERT = process.env.TLS_CERT || "/tls/client.crt";
-const TLS_KEY = process.env.TLS_KEY || "/tls/client.key";
-const NUM_CONNECTIONS = parseInt(process.env.NUM_CONNECTIONS || "20", 10);
-const VALUE_SIZE_BYTES = parseInt(process.env.VALUE_SIZE_BYTES || "524288", 10);
-const NUM_KEYS = parseInt(process.env.NUM_KEYS || "50", 10);
-const PIPELINE_BATCH = parseInt(process.env.PIPELINE_BATCH || "100", 10);
+const TLS_CA = process.env.TLS_CA;
+const TLS_CERT = process.env.TLS_CERT;
+const TLS_KEY = process.env.TLS_KEY;
+const NUM_CONNECTIONS = parseInt(process.env.NUM_CONNECTIONS || "30", 10);
+const NUM_JOBS = parseInt(process.env.NUM_JOBS || "50000", 10);
+const HGETALL_BATCH = parseInt(process.env.HGETALL_BATCH || "10000", 10);
 const TEST_DURATION_SECONDS = parseInt(process.env.TEST_DURATION_SECONDS || "120", 10);
 const ENABLE_AUTO_PIPELINING = process.env.ENABLE_AUTO_PIPELINING !== "false";
 
-// Counters
 let totalReads = 0;
 let totalErrors = 0;
 let econnresetCount = 0;
 let otherErrors = {};
 let reconnections = 0;
+let startTime;
+
+function getTlsOpts() {
+  if (!TLS_CA) return undefined;
+  return {
+    ca: fs.readFileSync(TLS_CA),
+    cert: TLS_CERT ? fs.readFileSync(TLS_CERT) : undefined,
+    key: TLS_KEY ? fs.readFileSync(TLS_KEY) : undefined,
+    servername: REDIS_HOST,
+  };
+}
 
 function createConnection(id) {
+  const tlsOpts = getTlsOpts();
   const conn = new Redis({
     host: REDIS_HOST,
     port: REDIS_PORT,
-    tls: {
-      ca: fs.readFileSync(TLS_CA),
-      cert: fs.readFileSync(TLS_CERT),
-      key: fs.readFileSync(TLS_KEY),
-      servername: REDIS_HOST,
-    },
+    tls: tlsOpts,
     enableAutoPipelining: ENABLE_AUTO_PIPELINING,
     enableOfflineQueue: false,
     maxRetriesPerRequest: 3,
@@ -63,111 +63,121 @@ function createConnection(id) {
     },
     keepAlive: 15000,
     connectTimeout: 10000,
-    commandTimeout: 30000,
+    commandTimeout: 60000,
     lazyConnect: true,
   });
 
   conn.on("error", (err) => {
     totalErrors++;
-    if (err.code === "ECONNRESET" || err.message?.includes("ECONNRESET")) {
+    const msg = err.message || "";
+    if (err.code === "ECONNRESET" || msg.includes("ECONNRESET")) {
       econnresetCount++;
     } else {
-      const key = err.code || err.message?.substring(0, 60) || "unknown";
+      const key = err.code || msg.substring(0, 60) || "unknown";
       otherErrors[key] = (otherErrors[key] || 0) + 1;
     }
-  });
-
-  conn.on("reconnecting", () => {
-    reconnections++;
   });
 
   return conn;
 }
 
-async function seedData(conn) {
-  console.log(`Seeding ${NUM_KEYS} keys of ${(VALUE_SIZE_BYTES / 1024 / 1024).toFixed(1)}MB each...`);
-  for (let i = 0; i < NUM_KEYS; i++) {
-    const value = crypto.randomBytes(VALUE_SIZE_BYTES).toString("base64");
-    await conn.set(`bigkey:${i}`, value);
+async function seedJobs(conn) {
+  console.log(`Seeding ${NUM_JOBS} fake BullMQ job hashes...`);
+  const BATCH = 5000;
+  for (let offset = 0; offset < NUM_JOBS; offset += BATCH) {
+    const pipeline = conn.pipeline();
+    const end = Math.min(offset + BATCH, NUM_JOBS);
+    for (let i = offset; i < end; i++) {
+      const jobId = `bull:scheduler-events:${i}`;
+      // Realistic BullMQ job hash (~865 bytes, matching production)
+      pipeline.hset(jobId, {
+        processedOn: Date.now().toString(),
+        data: JSON.stringify({
+          videoId: crypto.randomUUID(),
+          campaignId: crypto.randomUUID(),
+          organisationId: crypto.randomUUID(),
+          queue: "STANDARD",
+          variables: {
+            first_name: "Test",
+            last_name: "User",
+            company: "Acme Corp",
+            email: `user${i}@example.com`,
+            linkedin_url: `https://linkedin.com/in/user-${i}`,
+          },
+          status: "waiting-children",
+        }),
+        timestamp: Date.now().toString(),
+        delay: "0",
+        opts: JSON.stringify({
+          de: { id: `${crypto.randomUUID()}-queue-video`, ttl: 300000 },
+          backoff: { delay: 5000, type: "fixed" },
+          attempts: 3,
+        }),
+        returnvalue: "null",
+        atm: "1",
+        ats: "1",
+        priority: Math.floor(Math.random() * 100).toString(),
+        finishedOn: Date.now().toString(),
+        name: "video-complete",
+        deid: `${crypto.randomUUID()}-queue-video`,
+      });
+      // Also add to the sorted set (simulates waiting-children state)
+      pipeline.zadd("bull:scheduler-events:waiting-children", i.toString(), i.toString());
+    }
+    await pipeline.exec();
+    process.stdout.write(`  ${end}/${NUM_JOBS}\r`);
   }
+  console.log(`\nSeeded ${NUM_JOBS} jobs. Each ~865 bytes → total HGETALL response ~${((NUM_JOBS * 865) / 1024 / 1024).toFixed(0)}MB`);
 
-  // Also create a large list (simulates BullMQ queue with many job IDs)
-  console.log("Seeding large list with 10,000 entries...");
+  // Also seed some large individual values for LRANGE testing
   const pipeline = conn.pipeline();
   for (let i = 0; i < 10000; i++) {
-    pipeline.rpush("biglist", crypto.randomBytes(64).toString("hex"));
+    pipeline.rpush("bull:scheduler-events:biglist", crypto.randomBytes(64).toString("hex"));
   }
   await pipeline.exec();
-
-  // And large hashes (simulates BullMQ job data)
-  console.log("Seeding 5,000 hashes (simulating job objects)...");
-  const pipeline2 = conn.pipeline();
-  for (let i = 0; i < 5000; i++) {
-    pipeline2.hset(`job:${i}`, {
-      id: `job-${i}`,
-      data: JSON.stringify({
-        videoId: crypto.randomUUID(),
-        campaignId: crypto.randomUUID(),
-        organisationId: crypto.randomUUID(),
-        status: "waiting-children",
-        createdAt: Date.now(),
-        payload: crypto.randomBytes(200).toString("base64"),
-      }),
-      name: "video-complete",
-      timestamp: Date.now().toString(),
-      delay: "0",
-      priority: Math.floor(Math.random() * 100).toString(),
-    });
-  }
-  await pipeline2.exec();
-
-  console.log("Data seeded.\n");
+  console.log("Seeded 10K list entries.\n");
 }
 
-async function hammerReads(conn, id, stopSignal) {
-  const keys = Array.from({ length: NUM_KEYS }, (_, i) => `bigkey:${i}`);
+async function simulateGetJobs(conn, stopSignal) {
+  // This simulates exactly what BullMQ getJobs() does:
+  // Step 1: ZRANGE to get job IDs (the getRanges Lua script result)
+  // Step 2: HGETALL per job ID with auto-pipelining
 
   while (!stopSignal.stopped) {
     try {
-      // Strategy 1: Pipeline many GETs for large values
-      // This forces Redis to write large responses through TLS.
-      // We discard the data immediately to avoid OOM.
-      const promises = [];
-      for (let batch = 0; batch < PIPELINE_BATCH; batch++) {
-        const key = keys[batch % keys.length];
-        promises.push(
-          conn.getBuffer(key).then((buf) => {
-            totalReads++;
-            buf = null; // release immediately
-          })
-        );
-      }
+      // Step 1: Get job IDs from sorted set (like getRanges Lua)
+      // In production this is EVALSHA but the response is the same: array of IDs
+      const jobIds = await conn.zrange(
+        "bull:scheduler-events:waiting-children",
+        0,
+        HGETALL_BATCH - 1
+      );
+      totalReads++;
+
+      if (jobIds.length === 0) continue;
+
+      // Step 2: HGETALL per job — this is the killer.
+      // With enableAutoPipelining, ioredis batches all these into ONE pipeline.
+      // Redis responds with HGETALL_BATCH × ~865 bytes = multi-MB response.
+      const promises = jobIds.map((id) =>
+        conn.hgetall(`bull:scheduler-events:${id}`).then((data) => {
+          totalReads++;
+          data = null; // release immediately
+        })
+      );
       await Promise.allSettled(promises);
 
-      // Strategy 2: LRANGE the entire large list
-      await conn.lrange("biglist", 0, -1).then((result) => {
+      // Also do an LRANGE (simulates other BullMQ operations)
+      await conn.lrange("bull:scheduler-events:biglist", 0, -1).then((r) => {
         totalReads++;
-        result = null;
+        r = null;
       });
-
-      // Strategy 3: Pipeline HGETALL across many hashes
-      // (simulates BullMQ's getJobs() which does HGETALL per job)
-      const hgetPromises = [];
-      for (let i = 0; i < 1000; i++) {
-        hgetPromises.push(
-          conn.hgetall(`job:${i}`).then((result) => {
-            totalReads++;
-            result = null;
-          })
-        );
-      }
-      await Promise.allSettled(hgetPromises);
     } catch (err) {
-      // Errors are already counted by the error handler
+      // errors counted by handler
     }
 
-    // Small delay to avoid tight loop
-    await new Promise((r) => setTimeout(r, 10));
+    // Brief pause between rounds
+    await new Promise((r) => setTimeout(r, 50));
   }
 }
 
@@ -178,35 +188,29 @@ function printStats() {
   );
 }
 
-let startTime;
-
 async function main() {
-  console.log("=== Redis TLS + io-threads Bug Reproducer ===\n");
+  console.log("=== Redis TLS + BullMQ getJobs() Bug Reproducer ===\n");
   console.log("Config:");
-  console.log(`  Redis:              ${REDIS_HOST}:${REDIS_PORT} (TLS)`);
+  console.log(`  Redis:              ${REDIS_HOST}:${REDIS_PORT} (${TLS_CA ? "TLS" : "plaintext"})`);
   console.log(`  Connections:        ${NUM_CONNECTIONS}`);
-  console.log(`  Value size:         ${(VALUE_SIZE_BYTES / 1024 / 1024).toFixed(1)}MB`);
-  console.log(`  Keys:               ${NUM_KEYS}`);
-  console.log(`  Pipeline batch:     ${PIPELINE_BATCH}`);
+  console.log(`  Fake jobs:          ${NUM_JOBS}`);
+  console.log(`  HGETALL batch:      ${HGETALL_BATCH}`);
   console.log(`  Auto-pipelining:    ${ENABLE_AUTO_PIPELINING}`);
   console.log(`  Duration:           ${TEST_DURATION_SECONDS}s`);
+  console.log(`  Expected response:  ~${((HGETALL_BATCH * 865) / 1024 / 1024).toFixed(1)}MB per round`);
   console.log();
 
-  // Create connections
   const connections = [];
   for (let i = 0; i < NUM_CONNECTIONS; i++) {
     connections.push(createConnection(i));
   }
 
-  // Connect all
   console.log(`Connecting ${NUM_CONNECTIONS} clients...`);
   await Promise.all(connections.map((c) => c.connect()));
   console.log("All connected.\n");
 
-  // Seed data using first connection
-  await seedData(connections[0]);
+  await seedJobs(connections[0]);
 
-  // Get Redis info for the report
   const info = await connections[0].info("server");
   const versionMatch = info.match(/redis_version:(\S+)/);
   const opensslMatch = info.match(/openssl:(\S+)/);
@@ -216,27 +220,19 @@ async function main() {
   console.log(`io-threads:       ${ioThreadsConfig?.[1] || "unknown"}`);
   console.log();
 
-  // Start hammering
   startTime = Date.now();
   const stopSignal = { stopped: false };
 
-  console.log(`Starting ${NUM_CONNECTIONS} parallel read workers for ${TEST_DURATION_SECONDS}s...\n`);
+  console.log(`Starting ${NUM_CONNECTIONS} workers simulating getJobs() for ${TEST_DURATION_SECONDS}s...\n`);
 
-  // Print stats every 5 seconds
   const statsInterval = setInterval(printStats, 5000);
+  const workers = connections.map((conn, i) => simulateGetJobs(conn, stopSignal));
 
-  // Launch all workers
-  const workers = connections.map((conn, i) => hammerReads(conn, i, stopSignal));
-
-  // Wait for duration
   await new Promise((r) => setTimeout(r, TEST_DURATION_SECONDS * 1000));
   stopSignal.stopped = true;
-
-  // Wait for workers to finish current batch
   await Promise.allSettled(workers);
   clearInterval(statsInterval);
 
-  // Final stats
   console.log("\n=== RESULTS ===");
   console.log(`Duration:           ${TEST_DURATION_SECONDS}s`);
   console.log(`Total reads:        ${totalReads}`);
@@ -253,14 +249,12 @@ async function main() {
   console.log();
   if (econnresetCount > 0) {
     console.log("❌ BUG REPRODUCED: ECONNRESET errors detected.");
-    console.log("   This indicates TLS record corruption by Redis io-threads.");
+    console.log("   Redis is corrupting TLS records during large response writes.");
     console.log("   Check Redis logs: docker compose logs redis | grep -iE 'ssl|error|bad length'");
   } else {
-    console.log("✅ No ECONNRESET errors detected.");
-    console.log("   If running with io-threads 1, this is expected (bug not triggered).");
+    console.log("✅ No ECONNRESET errors detected in this run.");
   }
 
-  // Cleanup
   await Promise.allSettled(connections.map((c) => c.quit()));
   process.exit(econnresetCount > 0 ? 1 : 0);
 }
