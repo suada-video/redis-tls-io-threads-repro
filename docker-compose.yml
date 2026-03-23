@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: redis:8.2.1
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./certs:/tls:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "--tls", "--cert", "/tls/client.crt", "--key", "/tls/client.key", "--cacert", "/tls/ca.crt", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  client:
+    build:
+      context: ./client
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TLS_CA=/tls/ca.crt
+      - TLS_CERT=/tls/client.crt
+      - TLS_KEY=/tls/client.key
+      # Test parameters
+      - NUM_CONNECTIONS=50
+      - VALUE_SIZE_BYTES=1048576
+      - NUM_KEYS=20
+      - PIPELINE_BATCH=200
+      - TEST_DURATION_SECONDS=120
+      - ENABLE_AUTO_PIPELINING=true
+    volumes:
+      - ./certs:/tls:ro

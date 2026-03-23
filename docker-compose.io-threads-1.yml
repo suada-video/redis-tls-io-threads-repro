@@ -1,0 +1,8 @@
+# Override to test with io-threads 1 (control group)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.io-threads-1.yml up -d
+services:
+  redis:
+    command: redis-server /usr/local/etc/redis/redis.conf
+    volumes:
+      - ./redis-io1.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./certs:/tls:ro
