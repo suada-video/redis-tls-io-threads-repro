@@ -30,10 +30,10 @@ const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379", 10);
 const TLS_CA = process.env.TLS_CA || "/tls/ca.crt";
 const TLS_CERT = process.env.TLS_CERT || "/tls/client.crt";
 const TLS_KEY = process.env.TLS_KEY || "/tls/client.key";
-const NUM_CONNECTIONS = parseInt(process.env.NUM_CONNECTIONS || "50", 10);
-const VALUE_SIZE_BYTES = parseInt(process.env.VALUE_SIZE_BYTES || "1048576", 10);
-const NUM_KEYS = parseInt(process.env.NUM_KEYS || "20", 10);
-const PIPELINE_BATCH = parseInt(process.env.PIPELINE_BATCH || "200", 10);
+const NUM_CONNECTIONS = parseInt(process.env.NUM_CONNECTIONS || "20", 10);
+const VALUE_SIZE_BYTES = parseInt(process.env.VALUE_SIZE_BYTES || "524288", 10);
+const NUM_KEYS = parseInt(process.env.NUM_KEYS || "50", 10);
+const PIPELINE_BATCH = parseInt(process.env.PIPELINE_BATCH || "100", 10);
 const TEST_DURATION_SECONDS = parseInt(process.env.TEST_DURATION_SECONDS || "120", 10);
 const ENABLE_AUTO_PIPELINING = process.env.ENABLE_AUTO_PIPELINING !== "false";
 
@@ -130,35 +130,38 @@ async function hammerReads(conn, id, stopSignal) {
   while (!stopSignal.stopped) {
     try {
       // Strategy 1: Pipeline many GETs for large values
-      // This forces Redis to write NUM_KEYS * VALUE_SIZE_BYTES through TLS
+      // This forces Redis to write large responses through TLS.
+      // We discard the data immediately to avoid OOM.
       const promises = [];
       for (let batch = 0; batch < PIPELINE_BATCH; batch++) {
         const key = keys[batch % keys.length];
         promises.push(
-          conn.get(key).then(() => {
+          conn.getBuffer(key).then((buf) => {
             totalReads++;
+            buf = null; // release immediately
           })
         );
       }
+      await Promise.allSettled(promises);
 
       // Strategy 2: LRANGE the entire large list
-      promises.push(
-        conn.lrange("biglist", 0, -1).then(() => {
-          totalReads++;
-        })
-      );
+      await conn.lrange("biglist", 0, -1).then((result) => {
+        totalReads++;
+        result = null;
+      });
 
       // Strategy 3: Pipeline HGETALL across many hashes
       // (simulates BullMQ's getJobs() which does HGETALL per job)
-      for (let i = 0; i < 500; i++) {
-        promises.push(
-          conn.hgetall(`job:${i}`).then(() => {
+      const hgetPromises = [];
+      for (let i = 0; i < 1000; i++) {
+        hgetPromises.push(
+          conn.hgetall(`job:${i}`).then((result) => {
             totalReads++;
+            result = null;
           })
         );
       }
-
-      await Promise.allSettled(promises);
+      await Promise.allSettled(hgetPromises);
     } catch (err) {
       // Errors are already counted by the error handler
     }
